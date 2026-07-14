@@ -3,10 +3,7 @@ const Anthropic = require("@anthropic-ai/sdk");
 const User = require("../model/user");
 const InteractionLog = require("../model/interactionLog");
 
-// Requires ANTHROPIC_API_KEY in .env
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-// Sonnet for both endpoints — basket analysis needs clinical depth, not just speed
 const AI_MODEL = "claude-sonnet-4-6";
 
 // ---------- helpers ----------
@@ -21,13 +18,15 @@ const buildPatientContext = async (patientId) => {
   if (!patientId) return null;
   const patient = await User.findById(patientId).populate(
     "medications.medication",
-    "nameOfDrugs dosage dosageForm"
+    "nameOfDrugs dosage dosageForm",
   );
   if (!patient) return null;
 
   const currentMeds = (patient.medications || [])
     .filter((m) => m.current && m.medication)
-    .map((m) => `${m.medication.nameOfDrugs} ${m.medication.dosage || ""}`.trim());
+    .map((m) =>
+      `${m.medication.nameOfDrugs} ${m.medication.dosage || ""}`.trim(),
+    );
 
   return {
     age: calculateAge(patient.dateOfBirth),
@@ -44,11 +43,7 @@ const parseModelJSON = (text) => {
 
 // ---------- 1) Full basket analysis ----------
 // @route POST /api/ai/check-basket
-// Called each time a drug is added to or removed from the basket.
-// Analyses ALL drugs in the basket against each other AND against the patient.
-// Returns an array of alerts — each with a 2-line summary.
-//
-// body: { basket: [{name, dosage}], patientId?, sessionId?, hospitalId }
+// Returns compact one-line alerts: drug(s) → problem → reason → suggestion.
 const checkBasket = asyncHandler(async (req, res) => {
   const { basket = [], patientId, sessionId } = req.body;
   const hospitalId = req.body.hospitalId || req.hospitalId;
@@ -64,42 +59,41 @@ const checkBasket = asyncHandler(async (req, res) => {
     patient: patientContext || "No patient selected yet",
   };
 
-  const systemPrompt = `You are a clinical drug therapy screening assistant embedded in a hospital dispensing system used by licensed pharmacists in Nigeria.
+  const systemPrompt = `You are a clinical drug therapy screening assistant in a Nigerian hospital dispensing system.
 
-You receive the FULL dispensing basket (all drugs the pharmacist intends to dispense together) plus available patient context.
+You receive the FULL dispensing basket plus patient context. Analyse for:
+1. Drug-drug interactions (any pair in the basket)
+2. Drug-patient contraindications (age, gender, existing medications on record)
+3. Duplicate therapy (same therapeutic class)
+4. Dosage concerns for this patient profile
 
-Your job: analyse the basket comprehensively and identify ALL clinically relevant problems. Check for:
-1. **Drug-drug interactions** — between ANY pair of drugs in the basket.
-2. **Drug-patient contraindications** — any drug inappropriate for this patient's age, gender, or known conditions/medications on record.
-3. **Duplicate therapy** — two drugs from the same therapeutic class dispensed together without clear justification.
-4. **Dosage concerns** — where the dosage in the basket is unusual for the patient profile.
-5. **Any other drug therapy problem** a pharmacist should catch at the dispensing counter.
+Severity:
+- "minor": real but not clinically dangerous. Logged silently, NOT shown.
+- "critical": clinically significant risk. Must be shown.
+When uncertain, choose critical.
 
-Severity rules:
-- "minor": real but not clinically dangerous (mild absorption changes, spacing recommendations). These are logged silently.
-- "critical": clinically significant risk — the pharmacist MUST be alerted. When uncertain between minor and critical, choose critical.
+FORMAT — this is critical. Each alert must be ONE short punchy sentence that follows this exact pattern:
+"[Drug A + Drug B] — [what's wrong] because [why]. [What to do instead]."
 
-For each problem found, produce an alert object with:
-- "severity": "minor" or "critical"
-- "type": one of "interaction", "contraindication", "duplicate_therapy", "dosage_concern", "other"
-- "drugs": array of drug names from the basket involved in this alert
-- "summary": EXACTLY 2 short sentences. First sentence: what the problem is. Second sentence: the clinical consequence or what to check. Be direct, no fluff.
-  Example: "Warfarin and Ibuprofen interact significantly. This combination increases bleeding risk — verify INR and consider paracetamol instead."
+Examples of GOOD alerts:
+- "Warfarin + Ibuprofen — increases bleeding risk due to platelet inhibition and protein displacement. Use paracetamol instead."
+- "Ibuprofen — high GI bleed risk in patients over 70. Consider topical NSAID or paracetamol."
+- "Lisinopril + Spironolactone — risk of dangerous hyperkalemia from dual potassium retention. Monitor potassium closely or avoid combination."
 
 Rules:
-1. If the basket contains only one drug and no patient context issues, return an empty alerts array.
-2. Return ALL problems you find, not just the first one.
-3. Do NOT return alerts for non-issues — no alert is better than a false alert.
-4. You support, never replace, the pharmacist's professional judgment.
+1. Maximum 5 alerts. Only the most important ones.
+2. Each alert is ONE sentence. No headers, no bullet points, no paragraphs. Straight to the point.
+3. State the drugs, the problem, why, and what to do — nothing else.
+4. If no problems exist, return empty alerts array.
 
-Respond with ONLY a JSON object, no markdown, no preamble:
-{"alerts": [{"severity": "minor"|"critical", "type": "...", "drugs": ["..."], "summary": "Two sentences."}]}
-If no problems: {"alerts": []}`;
+Respond ONLY with JSON, no markdown:
+{"alerts": [{"severity": "minor"|"critical", "drugs": ["DrugA", "DrugB"], "line": "The one-sentence alert."}]}
+If clean: {"alerts": []}`;
 
   try {
     const response = await anthropic.messages.create({
       model: AI_MODEL,
-      max_tokens: 800,
+      max_tokens: 600,
       system: systemPrompt,
       messages: [{ role: "user", content: JSON.stringify(contextBlock) }],
     });
@@ -114,11 +108,15 @@ If no problems: {"alerts": []}`;
 
     const alerts = Array.isArray(result.alerts)
       ? result.alerts.filter(
-          (a) => a.severity && a.summary && Array.isArray(a.drugs) && a.drugs.length > 0
+          (a) =>
+            a.severity &&
+            a.line &&
+            Array.isArray(a.drugs) &&
+            a.drugs.length > 0,
         )
       : [];
 
-    // Persist all alerts for the audit trail
+    // Persist all for audit
     for (const alert of alerts) {
       InteractionLog.create({
         hospital: hospitalId,
@@ -130,15 +128,16 @@ If no problems: {"alerts": []}`;
           ? { age: patientContext.age, gender: patientContext.gender }
           : undefined,
         severity: alert.severity,
-        advisory: alert.summary,
+        advisory: alert.line,
         interactingWith: alert.drugs,
         surfaced: alert.severity === "critical",
-      }).catch((err) => console.error("InteractionLog write failed:", err.message));
+      }).catch((err) =>
+        console.error("InteractionLog write failed:", err.message),
+      );
     }
 
-    // Only return critical alerts to the UI; minor ones are logged silently
+    // Only surface critical
     const criticalAlerts = alerts.filter((a) => a.severity === "critical");
-
     return res.status(200).json({ alerts: criticalAlerts });
   } catch (error) {
     console.error("AI basket check failed:", error.message);
@@ -147,8 +146,6 @@ If no problems: {"alerts": []}`;
 });
 
 // ---------- 2) Sidebar clinical chat ----------
-// @route POST /api/ai/chat
-// body: { question, patientId?, basket: [{name, dosage}], history: [{role, content}] }
 const dispensingChat = asyncHandler(async (req, res) => {
   const { question, patientId, basket = [], history = [] } = req.body;
 
@@ -158,35 +155,31 @@ const dispensingChat = asyncHandler(async (req, res) => {
 
   const patientContext = await buildPatientContext(patientId);
 
-  const systemPrompt = `You are a clinical assistant embedded in a hospital dispensing workspace, chatting with a licensed pharmacist while they dispense medication.
+  const systemPrompt = `You are a clinical assistant embedded in a hospital dispensing workspace, chatting with a licensed pharmacist.
 
-CURRENT SESSION CONTEXT (live, from the dispensing workspace):
-- Active dispensing basket: ${
+CURRENT SESSION CONTEXT (live):
+- Dispensing basket: ${
     basket.length
       ? basket.map((b) => `${b.name} ${b.dosage || ""}`.trim()).join(", ")
       : "empty"
   }
 - Patient: ${
     patientContext
-      ? `age ${patientContext.age ?? "unknown"}, ${patientContext.gender || "gender unknown"}, current medications on record: ${
+      ? `age ${patientContext.age ?? "unknown"}, ${patientContext.gender || "gender unknown"}, medications on record: ${
           patientContext.currentMedications.length
             ? patientContext.currentMedications.join(", ")
-            : "none on record"
+            : "none"
         }`
       : "no patient selected"
   }
 
 Guidelines:
-- Answer clinical questions directly and concisely (2-5 sentences unless more detail is asked for). You are talking to a professional — no long disclaimers.
-- Use the session context: when they say "this" or "these drugs", they mean the basket above.
-- Be specific about mechanisms, monitoring, and dose adjustments where relevant.
-- If a question needs information you don't have (labs, full history), say exactly what to check.
-- If asked to elaborate on a specific drug therapy warning, provide:
-  1. The clinical mechanism behind the interaction/problem
-  2. The specific risk (what could happen)
-  3. Monitoring recommendations or safer alternatives
-  4. Any patient-specific considerations based on the context above
-- If genuinely uncertain, say so plainly rather than guessing. You support, never replace, the pharmacist's judgment.`;
+- Answer clinical questions directly and concisely. You are talking to a professional.
+- Use the session context: "this" or "these drugs" means the basket above.
+- Be specific about mechanisms, monitoring, and dose adjustments.
+- If asked to elaborate on a warning, provide: mechanism, specific risk, monitoring, and safer alternatives.
+- Use markdown formatting: headers, bold, lists, tables where helpful.
+- If uncertain, say so. You support, never replace, the pharmacist's judgment.`;
 
   const trimmedHistory = history.slice(-12).map((m) => ({
     role: m.role === "assistant" ? "assistant" : "user",
@@ -210,14 +203,12 @@ Guidelines:
   } catch (error) {
     console.error("AI chat failed:", error.message);
     res.status(502).json({
-      message:
-        "The clinical assistant is temporarily unavailable. Please rely on your standard references.",
+      message: "The clinical assistant is temporarily unavailable.",
     });
   }
 });
 
-// ---------- 3) Review the silent log ----------
-// @route GET /api/ai/interaction-logs/:hospitalId?severity=minor
+// ---------- 3) Interaction logs ----------
 const getInteractionLogs = asyncHandler(async (req, res) => {
   const { hospitalId } = req.params;
   const { severity, sessionId } = req.query;
